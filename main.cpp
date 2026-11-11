@@ -1,6 +1,7 @@
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <Novice.h>
+#include <cstdint>
 #include <cstring>
 #include <imgui.h>
 #include <winsock2.h>
@@ -8,31 +9,53 @@
 
 #pragma comment(lib, "Ws2_32.lib")
 
-// Windowsアプリのmain関数。ImGuiを使うため、Debugで実行する。
+// 指定したバイト数を完全に送信する関数
+bool SendAll(SOCKET sock, const char* data, int length) {
+	int totalSent = 0;
+	while (totalSent < length) {
+		int sent = send(sock, data + totalSent, length - totalSent, 0);
+		if (sent <= 0)
+			return false;
+		totalSent += sent;
+	}
+	return true;
+}
+
+// 指定したバイト数を完全に受信する関数
+bool RecvAll(SOCKET sock, char* buffer, int length) {
+	int totalRecv = 0;
+	while (totalRecv < length) {
+		int received = recv(sock, buffer + totalRecv, length - totalRecv, 0);
+		if (received <= 0)
+			return false;
+		totalRecv += received;
+	}
+	return true;
+}
+
 int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
-	Novice::Initialize("NT1_01_01", 640, 360);
+	Novice::Initialize("NT1_01_02", 640, 360);
 	char host[64] = "34.104.202.113";
-	char port[8] = "8001"; // 01_00・01_01のEcho用ポート
+	char port[8] = "8002"; // 01_02用のポート（必要に応じて変更）
 	bool connected = false;
 
 	WSADATA wsaData;
 	SOCKET sock = INVALID_SOCKET;
 
 	if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0) {
-		// 初期化失敗時の処理
+		// 初期化失敗処理
 	}
 
-	// 送受信用の変数
 	char sendText[256] = "Hello";
-	char echoText[256] = "";
-	int totalSentBytes = 0;
-	int totalRecvBytes = 0;
+	char replyText[512] = "";
+	int lastSentBytes = 0;
+	int lastRecvBytes = 0;
 
 	while (Novice::ProcessMessage() == 0) {
 		Novice::BeginFrame();
 #ifdef USE_IMGUI
 		ImGui::SetNextWindowPos(ImVec2(20, 20), ImGuiCond_Once);
-		ImGui::SetNextWindowSize(ImVec2(600, 300), ImGuiCond_Once);
+		ImGui::SetNextWindowSize(ImVec2(600, 320), ImGuiCond_Once);
 		ImGui::Begin("TCP Connection");
 		ImGui::BeginDisabled(connected);
 		ImGui::InputText("Host", host, sizeof(host));
@@ -41,8 +64,8 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
 			struct addrinfo hints = {};
 			struct addrinfo* result = nullptr;
 
-			hints.ai_family = AF_INET;       // IPv4
-			hints.ai_socktype = SOCK_STREAM; // TCP
+			hints.ai_family = AF_INET;
+			hints.ai_socktype = SOCK_STREAM;
 			hints.ai_protocol = IPPROTO_TCP;
 
 			if (getaddrinfo(host, port, &hints, &result) == 0) {
@@ -73,51 +96,50 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
 
 		ImGui::Separator();
 
-		// 送受信UI（接続中のみ操作可能）
 		ImGui::BeginDisabled(!connected);
 		ImGui::InputText("Text", sendText, sizeof(sendText));
 
 		if (ImGui::Button("Send")) {
-			int sendLength = (int)strlen(sendText);
-			int totalSent = 0;
+			uint32_t bodyLen = static_cast<uint32_t>(strlen(sendText));
 
-			// --- 送信処理：全データを送信するまでループ ---
-			while (totalSent < sendLength) {
-				int sent = send(sock, sendText + totalSent, sendLength - totalSent, 0);
-				if (sent == SOCKET_ERROR || sent == 0) {
-					// エラー判定または切断
-					break;
+			// 1. フレーム送信: 4バイトのヘッダー(ネットワークバイトオーダー) + 本文
+			uint32_t netLen = htonl(bodyLen); // ビッグエンディアンに変換
+
+			// 送信バッファの作成（ヘッダー4バイト + 本文）
+			char sendBuf[300];
+			std::memcpy(sendBuf, &netLen, 4);
+			std::memcpy(sendBuf + 4, sendText, bodyLen);
+
+			int totalSendSize = 4 + bodyLen;
+			if (SendAll(sock, sendBuf, totalSendSize)) {
+				lastSentBytes = totalSendSize;
+
+				// 2. ヘッダー受信: 4バイト受信して本文長を取得・種別確認
+				uint32_t recvNetLen = 0;
+				if (RecvAll(sock, reinterpret_cast<char*>(&recvNetLen), 4)) {
+					uint32_t recvBodyLen = ntohl(recvNetLen); // ホストバイトオーダーに戻す
+
+					// 3. 本文受信: ヘッダーが示す本文長まで正確に受信
+					if (recvBodyLen < sizeof(replyText)) {
+						std::memset(replyText, 0, sizeof(replyText));
+						if (RecvAll(sock, replyText, recvBodyLen)) {
+							lastRecvBytes = 4 + recvBodyLen;
+						} else {
+							connected = false; // 受信失敗
+						}
+					}
+				} else {
+					connected = false; // 受信失敗
 				}
-				totalSent += sent;
+			} else {
+				connected = false; // 送信失敗
 			}
-			totalSentBytes += totalSent;
-
-			// --- 受信処理：送信した長さ分をしっかりと受け取る ---
-			int totalRecv = 0;
-			std::memset(echoText, 0, sizeof(echoText));
-
-			while (totalRecv < sendLength) {
-				int received = recv(sock, echoText + totalRecv, sendLength - totalRecv, 0);
-				if (received == 0) {
-					// 正常切断
-					connected = false;
-					closesocket(sock);
-					sock = INVALID_SOCKET;
-					break;
-				} else if (received == SOCKET_ERROR) {
-					// エラー発生による失敗判定
-					break;
-				}
-				totalRecv += received;
-			}
-			totalRecvBytes += totalRecv;
 		}
 		ImGui::EndDisabled();
 
-		// 結果の表示
-		ImGui::Text("Echo: %s", echoText);
-		ImGui::Text("Sent Bytes: %d", totalSentBytes);
-		ImGui::Text("Received Bytes: %d", totalRecvBytes);
+		// 4. 表示
+		ImGui::Text("Reply: %s", replyText);
+		ImGui::Text("Sent / Received: %d / %d bytes", lastSentBytes, lastRecvBytes);
 
 		ImGui::End();
 #endif
