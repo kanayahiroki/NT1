@@ -10,11 +10,13 @@
 
 #pragma comment(lib, "Ws2_32.lib")
 
-// ※種別(Type)の番号は授業資料の定義に合わせて変更してください
+// ※メッセージ種別の番号はスライド資料の定義に合わせて変更してください
 enum class MessageType : uint8_t {
 	JoinRequest = 1,
-	WorldState = 2,
-	Disconnect = 3,
+	AssignPlayerId = 2,
+	WorldState = 3,
+	PlayerInput = 4,
+	Disconnect = 5,
 };
 
 struct Player {
@@ -47,59 +49,88 @@ bool RecvAll(SOCKET sock, char* buffer, int length) {
 	return true;
 }
 
-// 受信バッファにデータが来ているか確認（ブロッキング回避用）
+// 受信バッファにデータが来ているか確認（ブロッキングソケットのまま受信可否を判定）
 bool HasReadableData(SOCKET sock) {
 	fd_set readSet;
 	FD_ZERO(&readSet);
 	FD_SET(sock, &readSet);
-	timeval timeout = {0, 0}; // 待ち時間0で即座に確認
+	timeval timeout = {0, 0};
 	int res = select(0, &readSet, nullptr, nullptr, &timeout);
 	return res > 0 && FD_ISSET(sock, &readSet);
 }
 
 int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
-	// 画面サイズは課題指定の 1280x720
-	Novice::Initialize("NT1_01_03", 1280, 720);
+	Novice::Initialize("NT1_01_04", 1280, 720);
 	char host[64] = "34.104.202.113";
-	char port[8] = "8003"; // 01_03用のポート番号に変更してください
+	char port[8] = "8004"; // 01_04用のポート番号に変更してください
 	bool connected = false;
 
 	WSADATA wsaData;
 	SOCKET sock = INVALID_SOCKET;
 	WSAStartup(MAKEWORD(2, 2), &wsaData);
 
-	std::vector<Player> players;
+	char keys[256] = {0};
+	char preKeys[256] = {0};
 
-	// 切断時の共通処理
+	std::vector<Player> players;
+	uint32_t playerId = 0; // サーバーから受け取る自分のID（0は未割当想定）
+	bool hasPlayerId = false;
+	uint32_t loopCount = 0; // 自分の周りに広がる輪用のループ回数
+
+	// 【切断】Disconnectの受信・切断検出後は接続を閉じ、一覧とIDを戻す
 	auto DisconnectFromServer = [&]() {
 		if (sock != INVALID_SOCKET) {
 			closesocket(sock);
 			sock = INVALID_SOCKET;
 		}
 		connected = false;
-		players.clear(); // 一覧を空にする
+		players.clear();
+		playerId = 0;
+		hasPlayerId = false;
 	};
 
 	while (Novice::ProcessMessage() == 0) {
 		Novice::BeginFrame();
+		memcpy(preKeys, keys, 256);
+		Novice::GetHitKeyStateAll(keys);
 
-		// --- 受信・一覧更新処理（接続中のみ毎ループ実行） ---
+		loopCount++;
+
 		if (connected && sock != INVALID_SOCKET) {
-			// データが届いている場合のみ1フレーム読み切る
-			while (HasReadableData(sock)) {
-				// 1. ヘッダー4バイトを受信
-				// 例: [0-1]本文長(2byte), [2]種別(1byte), [3]予備(1byte) ※資料の仕様に合わせること
+			// --- 1. 【送信】PlayerInputを毎ループ作り、無入力の0も送る ---
+			// ※入力フォーマットは資料に合わせて変更してください（例：1バイトのビットフラグ）
+			uint8_t inputFlags = 0;
+			if (keys[DIK_W])
+				inputFlags |= (1 << 0); // 上
+			if (keys[DIK_S])
+				inputFlags |= (1 << 1); // 下
+			if (keys[DIK_A])
+				inputFlags |= (1 << 2); // 左
+			if (keys[DIK_D])
+				inputFlags |= (1 << 3); // 右
+
+			// ヘッダー4バイト + 本文1バイト（資料の形式に合わせる）
+			uint8_t inputFrame[5] = {
+			    0x00, 0x01, // 本文長 1
+			    static_cast<uint8_t>(MessageType::PlayerInput),
+			    0x00,      // 予備
+			    inputFlags // 本文（無入力なら0）
+			};
+			if (!SendAll(sock, reinterpret_cast<const char*>(inputFrame), sizeof(inputFrame))) {
+				DisconnectFromServer();
+			}
+
+			// --- 2. 【受信】届いているフレームを読み切る ---
+			while (connected && HasReadableData(sock)) {
 				uint8_t header[4] = {};
 				if (!RecvAll(sock, reinterpret_cast<char*>(header), 4)) {
 					DisconnectFromServer();
 					break;
 				}
 
-				// ヘッダーから本文長と種別を取り出す（ビッグエンディアン想定）
 				uint16_t bodyLen = (static_cast<uint16_t>(header[0]) << 8) | header[1];
 				uint8_t msgType = header[2];
 
-				// 2. 本文を受信
 				std::vector<uint8_t> body(bodyLen);
 				if (bodyLen > 0) {
 					if (!RecvAll(sock, reinterpret_cast<char*>(body.data()), bodyLen)) {
@@ -108,24 +139,28 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
 					}
 				}
 
-				// 3. 種別ごとの振り分け
 				if (msgType == static_cast<uint8_t>(MessageType::Disconnect)) {
-					// Disconnect なら接続を閉じる
 					DisconnectFromServer();
 					break;
+				} else if (msgType == static_cast<uint8_t>(MessageType::AssignPlayerId)) {
+					// 【ID】AssignPlayerIdの本文長を確かめ、本文のIDをplayerIdへ保存する
+					if (bodyLen >= 4) {
+						uint32_t netId = 0;
+						std::memcpy(&netId, body.data(), 4);
+						playerId = ntohl(netId);
+						hasPlayerId = true;
+					}
 				} else if (msgType == static_cast<uint8_t>(MessageType::WorldState)) {
-					// WorldState の人数・本文長を確かめ、players を更新する
-					// ※以下は「先頭1バイト(または2バイト)が人数、以降1人あたりID(4B)+X(4B)+Y(4B)」の場合の例
+					// 【一覧】WorldStateから全員の座標を取得（クライアント側では座標計算しない）
 					if (bodyLen >= 1) {
 						uint8_t count = body[0];
-						size_t expectedSize = 1 + count * 12; // 資料のデータ構造に合わせて調整
+						size_t expectedSize = 1 + count * 12; // 資料の構造に合わせて調整
 
 						if (bodyLen >= expectedSize) {
 							players.clear();
 							size_t offset = 1;
 							for (uint8_t i = 0; i < count; ++i) {
 								Player p{};
-								// ネットワークバイトオーダーから変換して読み出し
 								uint32_t netId, netX, netY;
 								std::memcpy(&netId, &body[offset], 4);
 								std::memcpy(&netX, &body[offset + 4], 4);
@@ -143,17 +178,26 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
 						}
 					}
 				}
-				// WorldState 以外は読み飛ばす（すでに本文までRecvAll済みなので何もしない）
 			}
 		}
 
-		// --- 描画処理 ---
-		// 全員を半径16、色 0x55BD79FF の円で描く
+		// --- 3. 【描画】WorldStateの座標で全員を描画 ---
 		for (const auto& p : players) {
-			Novice::DrawEllipse(static_cast<int>(p.x), static_cast<int>(p.y), 16, 16, 0.0f, 0x55BD79FF, kFillModeSolid);
+			bool isMe = (hasPlayerId && p.id == playerId);
+
+			// 自分のIDだけ色を変える（他人は 0x55BD79FF、自分は例えば橙色 0xF59E0BFF）
+			unsigned int color = isMe ? 0xF59E0BFF : 0x55BD79FF;
+
+			Novice::DrawEllipse(static_cast<int>(p.x), static_cast<int>(p.y), 16, 16, 0.0f, color, kFillModeSolid);
+
+			// 自分の周りにループの回数で広がる輪を描く
+			if (isMe) {
+				int ringRadius = 18 + (loopCount % 30); // 18〜47pxで広がるアニメーション例
+				Novice::DrawEllipse(static_cast<int>(p.x), static_cast<int>(p.y), ringRadius, ringRadius, 0.0f, color, kFillModeWireFrame);
+			}
 		}
 
-		// --- ImGui UI（画面上部に配置） ---
+		// --- ImGui UI ---
 #ifdef USE_IMGUI
 		ImGui::SetNextWindowPos(ImVec2(10, 10), ImGuiCond_Once);
 		ImGui::SetNextWindowSize(ImVec2(1260, 120), ImGuiCond_Once);
@@ -179,12 +223,8 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
 					if (connect(sock, result->ai_addr, (int)result->ai_addrlen) != SOCKET_ERROR) {
 						connected = true;
 
-						// 【参加】接続成功後に JoinRequest を一度送る（本文長0、全体4バイト）
-						uint8_t joinFrame[4] = {
-						    0x00, 0x00,                                     // 本文長 0
-						    static_cast<uint8_t>(MessageType::JoinRequest), // 種別
-						    0x00                                            // 予備
-						};
+						// 【参加】JoinRequestは接続後に一度送り、入力送信より先にする
+						uint8_t joinFrame[4] = {0x00, 0x00, static_cast<uint8_t>(MessageType::JoinRequest), 0x00};
 						if (!SendAll(sock, reinterpret_cast<const char*>(joinFrame), 4)) {
 							DisconnectFromServer();
 						}
@@ -205,8 +245,7 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
 		}
 		ImGui::EndDisabled();
 
-		// 状態・Players数・Game loopの表示
-		ImGui::Text("Status: %s | Players: %zu | Game loop: Running", connected ? "Connected" : "Not connected", players.size());
+		ImGui::Text("Status: %s | My ID: %u | Players: %zu | Loop: %u", connected ? "Connected" : "Not connected", playerId, players.size(), loopCount);
 
 		ImGui::End();
 #endif
