@@ -4,71 +4,38 @@
 #include <cstdint>
 #include <cstring>
 #include <imgui.h>
-#include <vector>
 #include <winsock2.h>
 #include <ws2tcpip.h>
 
 #pragma comment(lib, "Ws2_32.lib")
 
-// ヘッダー構造（全体4バイト）
-// ※授業資料の定義（2バイト本文長 + 2バイト種別、または 2バイト本文長 + 1バイト種別 + 1バイト予備）に合わせて調整してください
-#pragma pack(push, 1)
-struct MessageHeader {
-	uint16_t bodyLength; // 本文長（ネットワークバイトオーダー）
-	uint16_t type;       // 種別（例: 1 = text）
+// 01_02 資料 p6 の定義通り
+enum class MessageType : uint16_t {
+	Text = 1,
 };
-#pragma pack(pop)
 
-// 種別の定数（※配布資料の定義値に合わせる）
-constexpr uint16_t kMessageTypeText = 1;
-// 本文長の上限（不正な巨大データ防止）
-constexpr uint16_t kMaxBodyLength = 1024;
-
-// 指定バイト数を最後まで送信する関数
-bool SendAll(SOCKET sock, const char* data, int length) {
-	int totalSent = 0;
-	while (totalSent < length) {
-		int sent = send(sock, data + totalSent, length - totalSent, 0);
-		if (sent <= 0) {
-			return false;
-		}
-		totalSent += sent;
-	}
-	return true;
-}
-
-// 指定バイト数を最後まで受信する関数
-bool RecvAll(SOCKET sock, char* buffer, int length) {
-	int totalRecv = 0;
-	while (totalRecv < length) {
-		int received = recv(sock, buffer + totalRecv, length - totalRecv, 0);
-		if (received <= 0) {
-			return false;
-		}
-		totalRecv += received;
-	}
-	return true;
-}
-
-int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
+int WINAPI WinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE, _In_ LPSTR, _In_ int) {
 	Novice::Initialize("NT1_01_02", 640, 360);
 	char host[64] = "34.104.202.113";
 	char port[8] = "8000"; // 01_02以降は8000番
 	bool connected = false;
 
-	WSADATA wsaData;
-	SOCKET sock = INVALID_SOCKET;
-	WSAStartup(MAKEWORD(2, 2), &wsaData);
+	WSADATA wsaData{};
+	SOCKET clientSocket = INVALID_SOCKET;
+	if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0) {
+		Novice::Finalize();
+		return 1;
+	}
 
 	char sendText[256] = "Hello";
-	char replyText[1024] = "";
-	int sentBytes = 0;
-	int receivedBytes = 0;
+	char replyText[1025] = "";
+	int lastSentBytes = 0;
+	int lastRecvBytes = 0;
 
 	auto Disconnect = [&]() {
-		if (sock != INVALID_SOCKET) {
-			closesocket(sock);
-			sock = INVALID_SOCKET;
+		if (clientSocket != INVALID_SOCKET) {
+			closesocket(clientSocket);
+			clientSocket = INVALID_SOCKET;
 		}
 		connected = false;
 	};
@@ -91,13 +58,13 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
 			hints.ai_protocol = IPPROTO_TCP;
 
 			if (getaddrinfo(host, port, &hints, &result) == 0) {
-				sock = socket(result->ai_family, result->ai_socktype, result->ai_protocol);
-				if (sock != INVALID_SOCKET) {
-					if (connect(sock, result->ai_addr, (int)result->ai_addrlen) != SOCKET_ERROR) {
+				clientSocket = socket(result->ai_family, result->ai_socktype, result->ai_protocol);
+				if (clientSocket != INVALID_SOCKET) {
+					if (connect(clientSocket, result->ai_addr, (int)result->ai_addrlen) != SOCKET_ERROR) {
 						connected = true;
 					} else {
-						closesocket(sock);
-						sock = INVALID_SOCKET;
+						closesocket(clientSocket);
+						clientSocket = INVALID_SOCKET;
 					}
 				}
 				freeaddrinfo(result);
@@ -119,59 +86,87 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
 		ImGui::InputText("Text", sendText, sizeof(sendText));
 
 		if (ImGui::Button("Send")) {
-			uint16_t bodyLen = static_cast<uint16_t>(std::strlen(sendText));
+			// 1. 本文長・種別・本文を1つの配列へまとめる（p13）
+			uint16_t length = static_cast<uint16_t>(std::strlen(sendText));
+			if (length <= 1024) {
+				MessageType sendType = MessageType::Text;
+				char sendFrame[1028]{};
+				std::memcpy(sendFrame, &length, 2);
+				std::memcpy(sendFrame + 2, &sendType, 2);
+				if (length > 0) {
+					std::memcpy(sendFrame + 4, sendText, length);
+				}
 
-			// 1. フレーム送信：ヘッダー(4バイト)と本文をまとめて最後まで送る
-			MessageHeader sendHeader{};
-			sendHeader.bodyLength = htons(bodyLen);
-			sendHeader.type = htons(kMessageTypeText);
+				int totalSendSize = 4 + length;
+				int sentBytes = 0;
 
-			std::vector<char> sendFrame(sizeof(MessageHeader) + bodyLen);
-			std::memcpy(sendFrame.data(), &sendHeader, sizeof(MessageHeader));
-			if (bodyLen > 0) {
-				std::memcpy(sendFrame.data() + sizeof(MessageHeader), sendText, bodyLen);
-			}
-
-			if (SendAll(sock, sendFrame.data(), static_cast<int>(sendFrame.size()))) {
-				sentBytes = static_cast<int>(sendFrame.size());
-
-				// 2. ヘッダー受信：4バイト受信し、本文長と種別を読む
-				MessageHeader recvHeader{};
-				if (RecvAll(sock, reinterpret_cast<char*>(&recvHeader), sizeof(MessageHeader))) {
-					uint16_t recvBodyLen = ntohs(recvHeader.bodyLength);
-					uint16_t recvType = ntohs(recvHeader.type);
-
-					// 本文長の上限を確かめる
-					if (recvBodyLen <= kMaxBodyLength) {
-						std::vector<char> recvBody(recvBodyLen + 1, '\0');
-
-						// 3. 本文受信：ヘッダーが示す本文長まで最後まで受信する
-						if (recvBodyLen == 0 || RecvAll(sock, recvBody.data(), recvBodyLen)) {
-							receivedBytes = sizeof(MessageHeader) + recvBodyLen;
-
-							// 4. 表示：本文がそろい、種別が text なら終端を置き Reply へ表示する
-							if (recvType == kMessageTypeText) {
-								recvBody[recvBodyLen] = '\0';
-								std::memcpy(replyText, recvBody.data(), recvBodyLen + 1);
-							}
-						} else {
-							Disconnect();
-						}
-					} else {
-						// 上限超過時は安全のため切断
-						Disconnect();
+				// 2. 作ったフレーム全体を send で最後まで送る（p14）
+				while (connected && sentBytes < totalSendSize) {
+					int n = send(clientSocket, sendFrame + sentBytes, totalSendSize - sentBytes, 0);
+					if (n <= 0) {
+						connected = false;
+						break;
 					}
-				} else {
+					sentBytes += n;
+				}
+
+				if (connected) {
+					lastSentBytes = sentBytes;
+
+					// 3. 返信を受信する（ヘッダー4 + 本文上限1024 + 終端1 = 1029バイト）（p20）
+					char receiveFrame[1029]{};
+					int receivedBytes = 0;
+
+					// まずヘッダー4バイトを受信
+					while (connected && receivedBytes < 4) {
+						int n = recv(clientSocket, receiveFrame + receivedBytes, 4 - receivedBytes, 0);
+						if (n <= 0) {
+							connected = false;
+							break;
+						}
+						receivedBytes += n;
+					}
+
+					uint16_t payloadSize = 0;
+					MessageType recvType{};
+					if (connected) {
+						std::memcpy(&payloadSize, receiveFrame, 2);
+						std::memcpy(&recvType, receiveFrame + 2, 2);
+
+						// 本文長の上限（1024バイト）チェック
+						if (payloadSize > 1024) {
+							connected = false;
+						}
+					}
+
+					// ヘッダーが示す本文長まで受信
+					while (connected && receivedBytes < 4 + payloadSize) {
+						int n = recv(clientSocket, receiveFrame + receivedBytes, (4 + payloadSize) - receivedBytes, 0);
+						if (n <= 0) {
+							connected = false;
+							break;
+						}
+						receivedBytes += n;
+					}
+
+					// 4. 全体がそろい、種別が Text であることを確かめてから表示する（p20）
+					if (connected) {
+						lastRecvBytes = receivedBytes;
+						if (recvType == MessageType::Text) {
+							receiveFrame[receivedBytes] = '\0'; // 受信済みの直後に表示用の終端を置く
+							std::memcpy(replyText, receiveFrame + 4, payloadSize + 1);
+						}
+					}
+				}
+
+				if (!connected) {
 					Disconnect();
 				}
-			} else {
-				Disconnect();
 			}
 		}
 		ImGui::EndDisabled();
 
-		// ヘッダーを含む合計バイト数と Reply の表示
-		ImGui::Text("Sent / Received: %d / %d bytes", sentBytes, receivedBytes);
+		ImGui::Text("Sent / Received: %d / %d bytes", lastSentBytes, lastRecvBytes);
 		ImGui::Text("Reply: %s", replyText);
 
 		ImGui::End();
